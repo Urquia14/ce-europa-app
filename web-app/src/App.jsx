@@ -4,7 +4,7 @@ import {
   FileText, DollarSign, UploadCloud, AlertTriangle,
   X, Edit2, Trash2, Star, Eye, LayoutTemplate, SlidersHorizontal,
   Trophy, ListOrdered, Save, Menu, Sun, Moon, Calendar, ChevronRight,
-  ChevronLeft, UserPlus, Database, CheckCircle2, Upload, LogOut
+  ChevronLeft, UserPlus, Database, CheckCircle2, Upload, LogOut, RefreshCw
 } from 'lucide-react';
 import { supabase } from './supabaseClient';
 import Auth from './Auth.jsx';
@@ -304,6 +304,56 @@ function PlayerDetailModal({ player, matchReports, onClose, isDark }) {
               )}
             </div>
           </div>
+          {Array.isArray(player.trajectoria) && player.trajectoria.length > 0 && (
+            <div>
+              <h3 className={`text-base font-black uppercase tracking-widest border-b-2 pb-3 mb-4 flex items-center gap-3 ${t.textHighlight} ${t.border}`}>
+                <Trophy size={20} /> Trajectòria esportiva
+                {player.preferenteUpdatedAt && (
+                  <span className={`ml-auto text-[10px] font-bold ${t.textMuted}`}>
+                    Actualitzat {String(player.preferenteUpdatedAt).slice(0, 10)}
+                  </span>
+                )}
+              </h3>
+              <div className={`overflow-x-auto rounded-2xl border ${t.border}`}>
+                <table className="w-full text-left text-xs">
+                  <thead className={t.tableHead}>
+                    <tr>
+                      <th className="px-3 py-2">Temp.</th>
+                      <th className="px-3 py-2">Equip</th>
+                      <th className="px-2 py-2 text-center">PJ</th>
+                      <th className="px-2 py-2 text-center">MIN</th>
+                      <th className="px-2 py-2 text-center">GOL</th>
+                      <th className="px-2 py-2 text-center">TA</th>
+                      <th className="px-2 py-2 text-center">TR</th>
+                    </tr>
+                  </thead>
+                  <tbody className={`divide-y ${t.tableRowDivide}`}>
+                    {player.trajectoria.map((row, i) => (
+                      <tr key={i} className={t.tableRowHover}>
+                        <td className={`px-3 py-2 font-bold ${t.textMain}`}>{row.temporada || '—'}</td>
+                        <td className={`px-3 py-2 ${t.textMain}`}>{row.equipo || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.pj || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.min || '—'}</td>
+                        <td className={`px-2 py-2 text-center font-bold ${t.textHighlight}`}>{row.gol || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.ta || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.tr || '—'}</td>
+                      </tr>
+                    ))}
+                    {player.totalsCarrera && (
+                      <tr className={`font-black ${isDark ? 'bg-blue-900/30 text-blue-200' : 'bg-blue-50 text-blue-900'}`}>
+                        <td className="px-3 py-2" colSpan={2}>TOTALS</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.pj || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.min || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.gol || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.ta || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.tr || '—'}</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           {(player.linkPreferente || player.linkFCF) && (
             <div className="flex flex-wrap gap-3">
               {player.linkPreferente && <a href={player.linkPreferente} target="_blank" rel="noreferrer" className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-xs uppercase tracking-widest">La Preferente ↗</a>}
@@ -322,8 +372,49 @@ function JugadorsTab({ players, setPlayers, matchReports, showToast, setSelected
   const [formData, setFormData] = useState({ name: '', position: 'Migcentre', birthYear: '', team: '', isU23: false, comments: '', linkPreferente: '', linkFCF: '' });
   const [editingId, setEditingId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState({ done: 0, total: 0 });
   const fileInputRef = useRef(null);
   const t = getTheme(isDark);
+  // --- Bulk update from La Preferente ---
+  const handleBulkPreferenteUpdate = async () => {
+    const candidates = players.filter(
+      p => p.linkPreferente && /lapreferente\.com/i.test(p.linkPreferente)
+    );
+    if (!candidates.length) {
+      showToast("Cap jugador té URL de La Preferente.");
+      return;
+    }
+    if (!window.confirm(`Actualitzar ${candidates.length} jugador(s) de La Preferente? Pot trigar uns minuts.`)) return;
+    setUpdating(true);
+    setUpdateProgress({ done: 0, total: candidates.length });
+    let ok = 0, fail = 0;
+    const updates = {};
+    for (let i = 0; i < candidates.length; i++) {
+      const p = candidates[i];
+      try {
+        const r = await fetch('/api/preferente?url=' + encodeURIComponent(p.linkPreferente));
+        const j = await r.json();
+        if (r.ok && j && Array.isArray(j.trajectoria) && j.trajectoria.length) {
+          updates[p.id] = {
+            trajectoria: j.trajectoria,
+            totalsCarrera: j.totals || null,
+            preferenteUpdatedAt: j.fetchedAt || new Date().toISOString(),
+          };
+          ok++;
+        } else {
+          fail++;
+        }
+      } catch (e) {
+        fail++;
+      }
+      setUpdateProgress({ done: i + 1, total: candidates.length });
+      await new Promise(res => setTimeout(res, 400));
+    }
+    setPlayers(prev => prev.map(p => updates[p.id] ? { ...p, ...updates[p.id] } : p));
+    setUpdating(false);
+    showToast(`La Preferente: ${ok} actualitzats${fail ? `, ${fail} amb error` : ''}.`);
+  };
   const handleBirthYearChange = (e) => {
     const val = e.target.value;
     const year = parseInt(val, 10);
@@ -493,14 +584,26 @@ function JugadorsTab({ players, setPlayers, matchReports, showToast, setSelected
       <div className={`lg:col-span-2 2xl:col-span-3 p-6 sm:p-10 rounded-[40px] border flex flex-col min-h-[600px] lg:min-h-[800px] ${t.card}`}>
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-8 shrink-0">
           <h2 className={`text-2xl font-black flex items-center gap-3 ${t.textHighlight}`}><Database size={24} /> BASE DE DADES <span className={`text-lg ${t.textMuted}`}>({filteredPlayers.length})</span></h2>
-          <div className="relative w-full md:w-80">
-            <Search className={`absolute left-4 top-3.5 ${t.textMuted}`} size={18} />
-            <input
-              type="text"
-              placeholder="Cercar per nom o equip..."
-              className={`w-full pl-11 pr-4 py-3 border rounded-xl text-sm font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all ${t.input}`}
-              value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
-            />
+          <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3 w-full md:w-auto">
+            <button
+              type="button"
+              onClick={handleBulkPreferenteUpdate}
+              disabled={updating}
+              title="Actualitza la trajectòria esportiva de tots els jugadors amb URL de La Preferente"
+              className={`px-4 py-3 rounded-xl font-black text-xs uppercase tracking-widest border transition-colors flex items-center justify-center gap-2 shrink-0 ${updating ? 'opacity-70 cursor-wait' : ''} ${isDark ? 'bg-slate-700 border-slate-600 text-blue-300 hover:bg-slate-600' : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100'}`}
+            >
+              <RefreshCw size={16} className={updating ? 'animate-spin' : ''} />
+              {updating ? `Actualitzant ${updateProgress.done}/${updateProgress.total}…` : 'Actualitzar La Preferente'}
+            </button>
+            <div className="relative w-full md:w-80">
+              <Search className={`absolute left-4 top-3.5 ${t.textMuted}`} size={18} />
+              <input
+                type="text"
+                placeholder="Cercar per nom o equip..."
+                className={`w-full pl-11 pr-4 py-3 border rounded-xl text-sm font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all ${t.input}`}
+                value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+              />
+            </div>
           </div>
         </div>
         <div className={`flex-1 overflow-auto rounded-3xl border relative ${isDark ? 'bg-slate-900/50 border-slate-700/50' : 'bg-white border-slate-200'}`}>
