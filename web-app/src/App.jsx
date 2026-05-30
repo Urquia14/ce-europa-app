@@ -4,8 +4,10 @@ import {
   FileText, DollarSign, UploadCloud, AlertTriangle,
   X, Edit2, Trash2, Star, Eye, LayoutTemplate, SlidersHorizontal,
   Trophy, ListOrdered, Save, Menu, Sun, Moon, Calendar, ChevronRight,
-  ChevronLeft, UserPlus, Database, CheckCircle2, Upload
+  ChevronLeft, UserPlus, Database, CheckCircle2, Upload, LogOut, RefreshCw
 } from 'lucide-react';
+import { supabase } from './supabaseClient';
+import Auth from './Auth.jsx';
 /* =====================================================================
    CONSTANTS
 ===================================================================== */
@@ -242,10 +244,123 @@ function LineupList({ report, players, teamKey, typeKey, title, isTitular, updat
   );
 }
 /* =====================================================================
+   PREFERENTE PARSER (client-side, for manual paste)
+===================================================================== */
+const PREFERENTE_COLS = {
+  temporada: ['TEMPORADA'],
+  pos: ['POS.', 'POS'],
+  equipo: ['EQUIPO'],
+  rol: ['ROL'],
+  pc: ['PC'],
+  pj: ['PJ'],
+  pt: ['PT'],
+  min: ['MIN'],
+  gol: ['GOL'],
+  ta: ['TA'],
+  tr: ['TR'],
+  g: ['G'],
+  e: ['E'],
+  p: ['P'],
+};
+const PREFERENTE_KEYWORDS = ['TEMPORADA', 'EQUIPO', 'MIN', 'GOL', 'PJ'];
+
+function buildPreferenteRows(headers, rowCells) {
+  const idx = {};
+  for (const [k, aliases] of Object.entries(PREFERENTE_COLS)) {
+    idx[k] = headers.findIndex(h => aliases.includes(h));
+  }
+  const out = { trajectoria: [], totals: null };
+  rowCells.forEach(cells => {
+    if (!cells.length) return;
+    const obj = {};
+    for (const k of Object.keys(PREFERENTE_COLS)) {
+      const j = idx[k];
+      obj[k] = j !== -1 && j < cells.length ? cells[j] : '';
+    }
+    const joined = cells.join(' ').toUpperCase();
+    if (/\bTOTAL/.test(joined) && !obj.temporada && !obj.equipo) {
+      out.totals = obj;
+    } else if (obj.temporada || obj.equipo) {
+      out.trajectoria.push(obj);
+    } else if (/\bTOTAL/.test(joined)) {
+      out.totals = obj;
+    }
+  });
+  return out;
+}
+
+function parsePreferenteHTML(html) {
+  let doc;
+  try { doc = new DOMParser().parseFromString(html, 'text/html'); }
+  catch (e) { return null; }
+  let bestTable = null, bestScore = 0, bestHeaders = [];
+  doc.querySelectorAll('table').forEach(table => {
+    const firstRow = table.querySelector('tr');
+    if (!firstRow) return;
+    const headers = Array.from(firstRow.querySelectorAll('th, td'))
+      .map(c => (c.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase());
+    const score = PREFERENTE_KEYWORDS.reduce(
+      (s, k) => s + (headers.some(h => h === k || h.includes(k)) ? 1 : 0), 0);
+    if (score > bestScore) { bestScore = score; bestTable = table; bestHeaders = headers; }
+  });
+  if (!bestTable || bestScore < 2) return null;
+  const rows = Array.from(bestTable.querySelectorAll('tr')).slice(1).map(row =>
+    Array.from(row.querySelectorAll('td, th'))
+      .map(c => (c.textContent || '').replace(/\s+/g, ' ').trim())
+  );
+  return buildPreferenteRows(bestHeaders, rows);
+}
+
+function parsePreferenteTSV(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const sepRe = /\t|\s{2,}|;|\|/;
+  let headerIdx = -1, headers = [];
+  for (let i = 0; i < lines.length; i++) {
+    const parts = lines[i].split(sepRe).map(s => s.trim()).filter(Boolean);
+    const upper = parts.map(p => p.toUpperCase());
+    const hits = PREFERENTE_KEYWORDS.reduce(
+      (s, k) => s + (upper.some(h => h === k || h.includes(k)) ? 1 : 0), 0);
+    if (hits >= 3) { headerIdx = i; headers = upper; break; }
+  }
+  if (headerIdx === -1) return null;
+  const rows = lines.slice(headerIdx + 1).map(line => line.split(sepRe).map(s => s.trim()));
+  return buildPreferenteRows(headers, rows);
+}
+
+function parsePreferenteText(text) {
+  if (!text || !text.trim()) return null;
+  const hasHtml = /<\/?(table|tr|td|th|html|body|div)\b/i.test(text);
+  if (hasHtml) {
+    const r = parsePreferenteHTML(text);
+    if (r && r.trajectoria.length) return r;
+  }
+  return parsePreferenteTSV(text);
+}
+
+/* =====================================================================
    PLAYER DETAIL MODAL
 ===================================================================== */
-function PlayerDetailModal({ player, matchReports, onClose, isDark }) {
+function PlayerDetailModal({ player, matchReports, onClose, isDark, onUpdatePlayer }) {
   const t = getTheme(isDark);
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [parseMsg, setParseMsg] = useState(null);
+  const handleManualImport = () => {
+    const parsed = parsePreferenteText(pasteText);
+    if (!parsed || !parsed.trajectoria || !parsed.trajectoria.length) {
+      setParseMsg("FAIL · No s'ha trobat cap fila de trajectòria. Comprova d'haver copiat la taula 'Historial Deportivo' o tot el codi font de la pàgina.");
+      return;
+    }
+    if (onUpdatePlayer) {
+      onUpdatePlayer(player.id, {
+        trajectoria: parsed.trajectoria,
+        totalsCarrera: parsed.totals || null,
+        preferenteUpdatedAt: new Date().toISOString(),
+      });
+    }
+    setParseMsg(`OK · ${parsed.trajectoria.length} files importades.`);
+    setTimeout(() => { setShowPaste(false); setPasteText(''); setParseMsg(null); }, 1400);
+  };
   if (!player) return null;
   const reports = matchReports.reduce((acc, report) => {
     const slot = [...report.titularsLocal, ...report.canvisLocal, ...report.titularsVisitant, ...report.canvisVisitant]
@@ -302,6 +417,106 @@ function PlayerDetailModal({ player, matchReports, onClose, isDark }) {
               )}
             </div>
           </div>
+          {Array.isArray(player.trajectoria) && player.trajectoria.length > 0 && (
+            <div>
+              <h3 className={`text-base font-black uppercase tracking-widest border-b-2 pb-3 mb-4 flex items-center gap-3 ${t.textHighlight} ${t.border}`}>
+                <Trophy size={20} /> Trajectòria esportiva
+                {player.preferenteUpdatedAt && (
+                  <span className={`ml-auto text-[10px] font-bold ${t.textMuted}`}>
+                    Actualitzat {String(player.preferenteUpdatedAt).slice(0, 10)}
+                  </span>
+                )}
+              </h3>
+              <div className={`overflow-x-auto rounded-2xl border ${t.border}`}>
+                <table className="w-full text-left text-xs">
+                  <thead className={t.tableHead}>
+                    <tr>
+                      <th className="px-3 py-2">Temp.</th>
+                      <th className="px-3 py-2">Equip</th>
+                      <th className="px-2 py-2 text-center">PJ</th>
+                      <th className="px-2 py-2 text-center">MIN</th>
+                      <th className="px-2 py-2 text-center">GOL</th>
+                      <th className="px-2 py-2 text-center">TA</th>
+                      <th className="px-2 py-2 text-center">TR</th>
+                    </tr>
+                  </thead>
+                  <tbody className={`divide-y ${t.tableRowDivide}`}>
+                    {player.trajectoria.map((row, i) => (
+                      <tr key={i} className={t.tableRowHover}>
+                        <td className={`px-3 py-2 font-bold ${t.textMain}`}>{row.temporada || '—'}</td>
+                        <td className={`px-3 py-2 ${t.textMain}`}>{row.equipo || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.pj || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.min || '—'}</td>
+                        <td className={`px-2 py-2 text-center font-bold ${t.textHighlight}`}>{row.gol || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.ta || '—'}</td>
+                        <td className={`px-2 py-2 text-center ${t.textMuted}`}>{row.tr || '—'}</td>
+                      </tr>
+                    ))}
+                    {player.totalsCarrera && (
+                      <tr className={`font-black ${isDark ? 'bg-blue-900/30 text-blue-200' : 'bg-blue-50 text-blue-900'}`}>
+                        <td className="px-3 py-2" colSpan={2}>TOTALS</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.pj || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.min || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.gol || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.ta || '—'}</td>
+                        <td className="px-2 py-2 text-center">{player.totalsCarrera.tr || '—'}</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          <div>
+            <h3 className={`text-xs font-black uppercase tracking-widest mb-3 ${t.textMuted}`}>
+              Importar trajectòria manualment
+            </h3>
+            {!showPaste ? (
+              <button
+                type="button"
+                onClick={() => setShowPaste(true)}
+                className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-white font-black text-xs uppercase tracking-widest"
+              >
+                Enganxar dades de La Preferente
+              </button>
+            ) : (
+              <div className={`p-4 rounded-2xl border space-y-3 ${t.panel}`}>
+                <p className={`text-xs leading-relaxed ${t.textMuted}`}>
+                  Obre la pàgina del jugador a La Preferente al teu navegador, selecciona la taula
+                  <b> Historial Deportivo</b> amb el ratolí, fes <b>Ctrl+C</b>, i enganxa-ho aquí amb <b>Ctrl+V</b>.
+                  Alternativa: dins la pàgina prem <b>Ctrl+U</b> (codi font) → <b>Ctrl+A</b> → <b>Ctrl+C</b> i enganxa-ho tot.
+                </p>
+                <textarea
+                  rows={6}
+                  value={pasteText}
+                  onChange={e => setPasteText(e.target.value)}
+                  placeholder="Enganxa aquí…"
+                  className={`w-full p-3 border rounded-xl text-xs font-mono outline-none focus:border-blue-500 ${t.input}`}
+                />
+                {parseMsg && (
+                  <p className={`text-xs font-bold ${parseMsg.startsWith('OK') ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {parseMsg}
+                  </p>
+                )}
+                <div className="flex gap-2 justify-end">
+                  <button
+                    type="button"
+                    onClick={() => { setShowPaste(false); setPasteText(''); setParseMsg(null); }}
+                    className={`px-4 py-2 rounded-xl border text-xs font-black uppercase tracking-widest ${isDark ? 'bg-slate-800 border-slate-600 text-slate-300 hover:bg-slate-700' : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'}`}
+                  >
+                    Cancel·la
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleManualImport}
+                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black uppercase tracking-widest"
+                  >
+                    Importar
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
           {(player.linkPreferente || player.linkFCF) && (
             <div className="flex flex-wrap gap-3">
               {player.linkPreferente && <a href={player.linkPreferente} target="_blank" rel="noreferrer" className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-black text-xs uppercase tracking-widest">La Preferente ↗</a>}
@@ -320,8 +535,49 @@ function JugadorsTab({ players, setPlayers, matchReports, showToast, setSelected
   const [formData, setFormData] = useState({ name: '', position: 'Migcentre', birthYear: '', team: '', isU23: false, comments: '', linkPreferente: '', linkFCF: '' });
   const [editingId, setEditingId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState({ done: 0, total: 0 });
   const fileInputRef = useRef(null);
   const t = getTheme(isDark);
+  // --- Bulk update from La Preferente ---
+  const handleBulkPreferenteUpdate = async () => {
+    const candidates = players.filter(
+      p => p.linkPreferente && /lapreferente\.com/i.test(p.linkPreferente)
+    );
+    if (!candidates.length) {
+      showToast("Cap jugador té URL de La Preferente.");
+      return;
+    }
+    if (!window.confirm(`Actualitzar ${candidates.length} jugador(s) de La Preferente? Pot trigar uns minuts.`)) return;
+    setUpdating(true);
+    setUpdateProgress({ done: 0, total: candidates.length });
+    let ok = 0, fail = 0;
+    const updates = {};
+    for (let i = 0; i < candidates.length; i++) {
+      const p = candidates[i];
+      try {
+        const r = await fetch('/api/preferente?url=' + encodeURIComponent(p.linkPreferente));
+        const j = await r.json();
+        if (r.ok && j && Array.isArray(j.trajectoria) && j.trajectoria.length) {
+          updates[p.id] = {
+            trajectoria: j.trajectoria,
+            totalsCarrera: j.totals || null,
+            preferenteUpdatedAt: j.fetchedAt || new Date().toISOString(),
+          };
+          ok++;
+        } else {
+          fail++;
+        }
+      } catch (e) {
+        fail++;
+      }
+      setUpdateProgress({ done: i + 1, total: candidates.length });
+      await new Promise(res => setTimeout(res, 400));
+    }
+    setPlayers(prev => prev.map(p => updates[p.id] ? { ...p, ...updates[p.id] } : p));
+    setUpdating(false);
+    showToast(`La Preferente: ${ok} actualitzats${fail ? `, ${fail} amb error` : ''}.`);
+  };
   const handleBirthYearChange = (e) => {
     const val = e.target.value;
     const year = parseInt(val, 10);
@@ -491,14 +747,26 @@ function JugadorsTab({ players, setPlayers, matchReports, showToast, setSelected
       <div className={`lg:col-span-2 2xl:col-span-3 p-6 sm:p-10 rounded-[40px] border flex flex-col min-h-[600px] lg:min-h-[800px] ${t.card}`}>
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-8 shrink-0">
           <h2 className={`text-2xl font-black flex items-center gap-3 ${t.textHighlight}`}><Database size={24} /> BASE DE DADES <span className={`text-lg ${t.textMuted}`}>({filteredPlayers.length})</span></h2>
-          <div className="relative w-full md:w-80">
-            <Search className={`absolute left-4 top-3.5 ${t.textMuted}`} size={18} />
-            <input
-              type="text"
-              placeholder="Cercar per nom o equip..."
-              className={`w-full pl-11 pr-4 py-3 border rounded-xl text-sm font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all ${t.input}`}
-              value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
-            />
+          <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3 w-full md:w-auto">
+            <button
+              type="button"
+              onClick={handleBulkPreferenteUpdate}
+              disabled={updating}
+              title="Actualitza la trajectòria esportiva de tots els jugadors amb URL de La Preferente"
+              className={`px-4 py-3 rounded-xl font-black text-xs uppercase tracking-widest border transition-colors flex items-center justify-center gap-2 shrink-0 ${updating ? 'opacity-70 cursor-wait' : ''} ${isDark ? 'bg-slate-700 border-slate-600 text-blue-300 hover:bg-slate-600' : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100'}`}
+            >
+              <RefreshCw size={16} className={updating ? 'animate-spin' : ''} />
+              {updating ? `Actualitzant ${updateProgress.done}/${updateProgress.total}…` : 'Actualitzar La Preferente'}
+            </button>
+            <div className="relative w-full md:w-80">
+              <Search className={`absolute left-4 top-3.5 ${t.textMuted}`} size={18} />
+              <input
+                type="text"
+                placeholder="Cercar per nom o equip..."
+                className={`w-full pl-11 pr-4 py-3 border rounded-xl text-sm font-bold outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all ${t.input}`}
+                value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+              />
+            </div>
           </div>
         </div>
         <div className={`flex-1 overflow-auto rounded-3xl border relative ${isDark ? 'bg-slate-900/50 border-slate-700/50' : 'bg-white border-slate-200'}`}>
@@ -1456,7 +1724,7 @@ function TasksTab({ tasks, setTasks, showToast, isDark }) {
 /* =====================================================================
    MAIN APP
 ===================================================================== */
-export default function App() {
+function ScoutingApp({ session }) {
   const [activeTab, setActiveTab] = useState('jugadors');
   const [isDark, setIsDark] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -1486,19 +1754,16 @@ export default function App() {
     setToast(msg);
     setTimeout(() => setToast(null), 2800);
   }, []);
-  // --- LOAD from persistent storage on mount ---
+  // --- LOAD from Supabase on mount / login ---
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
-        if (!window.storage) {
-          setIsLoading(false);
-          return;
-        }
-        const result = await window.storage.get(STORAGE_KEY);
+        const { data: row } = await supabase
+          .from('user_state').select('data').eq('user_id', session.user.id).maybeSingle();
         if (cancelled) return;
-        if (result && result.value) {
-          const data = JSON.parse(result.value);
+        const data = row && row.data ? row.data : null;
+        if (data) {
           if (data.players) setPlayers(data.players);
           if (data.matchReports) setMatchReports(data.matchReports);
           if (data.squadData) {
@@ -1515,19 +1780,17 @@ export default function App() {
           if (data.isDark !== undefined) setIsDark(data.isDark);
         }
       } catch (e) {
-        // No data yet, or load error — start fresh
-        console.log('No saved data found, starting fresh.');
+        console.log('Load error:', e);
       } finally {
         if (!cancelled) setIsLoading(false);
       }
     };
     load();
     return () => { cancelled = true; };
-  }, []);
-  // --- SAVE to persistent storage (debounced) ---
+  }, [session.user.id]);
+  // --- SAVE to Supabase (debounced) ---
   useEffect(() => {
     if (isLoading) return; // don't save during initial load
-    if (!window.storage) return;
     setSaveStatus('saving');
     const timer = setTimeout(async () => {
       try {
@@ -1535,19 +1798,17 @@ export default function App() {
           players, matchReports, squadData, plantillaActual,
           evaluations, budgetLimits, salaries, tasks, isDark
         };
-        const result = await window.storage.set(STORAGE_KEY, JSON.stringify(payload));
-        if (result) {
-          setSaveStatus('synced');
-        } else {
-          setSaveStatus('error');
-        }
+        const { error } = await supabase.from('user_state').upsert({
+          user_id: session.user.id, data: payload, updated_at: new Date().toISOString()
+        });
+        setSaveStatus(error ? 'error' : 'synced');
       } catch (e) {
         console.error('Save error:', e);
         setSaveStatus('error');
       }
     }, 800);
     return () => clearTimeout(timer);
-  }, [players, matchReports, squadData, plantillaActual, evaluations, budgetLimits, salaries, tasks, isDark, isLoading]);
+  }, [players, matchReports, squadData, plantillaActual, evaluations, budgetLimits, salaries, tasks, isDark, isLoading, session.user.id]);
   // --- EXPORT to JSON file ---
   const handleExport = () => {
     const payload = {
@@ -1653,7 +1914,6 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 sm:gap-3">
-            {/* Save status */}
             <span className={`hidden sm:flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest px-3 py-1.5 rounded-lg border ${
               saveStatus === 'synced' ? (isDark ? 'bg-emerald-900/30 border-emerald-700/40 text-emerald-400' : 'bg-emerald-50 border-emerald-200 text-emerald-700') :
               saveStatus === 'saving' ? (isDark ? 'bg-amber-900/30 border-amber-700/40 text-amber-400' : 'bg-amber-50 border-amber-200 text-amber-700') :
@@ -1671,22 +1931,16 @@ export default function App() {
             <button onClick={() => setIsDark(!isDark)} title="Canviar tema" className={`p-2.5 rounded-xl border transition-colors ${isDark ? 'bg-slate-700 border-slate-600 hover:bg-slate-600 text-slate-200' : 'bg-white border-blue-200 hover:bg-blue-50 text-blue-700'}`}>
               {isDark ? <Sun size={18} /> : <Moon size={18} />}
             </button>
+            <button onClick={async () => { await supabase.auth.signOut(); }} title="Tancar sessió" className={`p-2.5 rounded-xl border transition-colors ${isDark ? 'bg-slate-700 border-slate-600 hover:bg-slate-600 text-slate-200' : 'bg-white border-blue-200 hover:bg-blue-50 text-blue-700'}`}>
+              <LogOut size={18} />
+            </button>
           </div>
         </div>
       </header>
-      {/* LAYOUT: SIDEBAR + MAIN */}
       <div className="flex">
-        {/* SIDEBAR - desktop */}
         <aside className={`hidden lg:flex flex-col w-64 min-h-[calc(100vh-80px)] border-r p-4 gap-2 ${t.sidebar}`}>
           {tabs.map(tab => (
-            <SidebarBtn
-              key={tab.key}
-              active={activeTab === tab.key}
-              onClick={() => setActiveTab(tab.key)}
-              icon={tab.icon}
-              label={tab.label}
-              isDark={isDark}
-            />
+            <SidebarBtn key={tab.key} active={activeTab === tab.key} onClick={() => setActiveTab(tab.key)} icon={tab.icon} label={tab.label} isDark={isDark} />
           ))}
           <div className={`mt-auto pt-6 border-t ${t.border}`}>
             <p className={`text-[10px] font-bold uppercase tracking-widest text-center ${t.textMuted}`}>
@@ -1694,7 +1948,6 @@ export default function App() {
             </p>
           </div>
         </aside>
-        {/* SIDEBAR - mobile drawer */}
         {sidebarOpen && (
           <div className="lg:hidden fixed inset-0 z-50 flex" onClick={() => setSidebarOpen(false)}>
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
@@ -1704,27 +1957,48 @@ export default function App() {
                 <button onClick={() => setSidebarOpen(false)} className={`p-1.5 rounded-lg ${isDark ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-100 text-slate-600'}`}><X size={20} /></button>
               </div>
               {tabs.map(tab => (
-                <SidebarBtn
-                  key={tab.key}
-                  active={activeTab === tab.key}
-                  onClick={() => { setActiveTab(tab.key); setSidebarOpen(false); }}
-                  icon={tab.icon}
-                  label={tab.label}
-                  isDark={isDark}
-                />
+                <SidebarBtn key={tab.key} active={activeTab === tab.key} onClick={() => { setActiveTab(tab.key); setSidebarOpen(false); }} icon={tab.icon} label={tab.label} isDark={isDark} />
               ))}
             </aside>
           </div>
         )}
-        {/* MAIN */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 min-w-0">
           {renderTab()}
         </main>
       </div>
-      {/* MODALS */}
-      <PlayerDetailModal player={selectedPlayer} matchReports={matchReports} onClose={() => setSelectedPlayer(null)} isDark={isDark} />
-      {/* TOAST */}
+      <PlayerDetailModal
+        player={selectedPlayer}
+        matchReports={matchReports}
+        onClose={() => setSelectedPlayer(null)}
+        isDark={isDark}
+        onUpdatePlayer={(id, updates) => {
+          setPlayers(prev => prev.map(p => p.id === id ? { ...p, ...updates } : p));
+          setSelectedPlayer(prev => (prev && prev.id === id ? { ...prev, ...updates } : prev));
+        }}
+      />
       <Toast toast={toast} isDark={isDark} />
     </div>
   );
+}
+
+/* =====================================================================
+   AUTH GATE (default export)
+===================================================================== */
+export default function App() {
+  const [session, setSession] = useState(undefined);
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => { if (active) setSession(data.session); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => { active = false; sub.subscription.unsubscribe(); };
+  }, []);
+  if (session === undefined) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <p className="font-black uppercase tracking-widest text-sm text-blue-600">Carregant…</p>
+      </div>
+    );
+  }
+  if (!session) return <Auth />;
+  return <ScoutingApp key={session.user.id} session={session} />;
 }
